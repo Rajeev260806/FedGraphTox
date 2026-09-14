@@ -96,11 +96,28 @@ def parse_tree_file(path):
 def build_graph(root_id, edges, root_uid, label_str, label_map, text):
     """
     Convert parsed edges into a PyG Data object.
-    Node features are currently minimal placeholders (in-degree, out-degree,
-    is_root flag) -- swap in real user/behavioral features here if you have
-    them later.
+
+    Node features (7 dims, richer than the original 3):
+        0. in_degree    - how many direct engagements point TO this user
+        1. out_degree   - how many direct engagements point FROM this user
+        2. is_root      - 1.0 if this is the original tweet's author, else 0.0
+        3. depth        - hops from the root along the propagation tree
+                           (root=0, direct repliers=1, etc.)
+        4. subtree_size - how many users are downstream of this node
+                           (i.e. how much of the cascade this user "triggered")
+        5. avg_response_time - average time delta of this node's OUTGOING
+                           edges (how quickly people reacted to THIS user)
+        6. min_response_time - fastest reaction time to this user (0.0 if
+                           this node has no outgoing edges / is a leaf)
+
+    WHY THESE: with only degree + is_root (the original 3), the model was
+    stuck at chance-level accuracy. Depth and subtree_size capture the
+    SHAPE of the cascade (how deep/branching it goes), and the response
+    time features capture the SPEED of propagation -- both are
+    structure-only signals (no text used) that prior rumor-detection
+    literature (e.g. BiGCN) has found informative, since rumors and
+    verified news tend to propagate differently in shape and speed.
     """
-    # Collect all unique user ids that appear (as parent or child)
     users = set()
     for p, c, _t in edges:
         users.add(p)
@@ -131,10 +148,51 @@ def build_graph(root_id, edges, root_uid, label_str, label_map, text):
         in_deg[d] += 1
 
     root_idx = uid_to_idx.get(root_uid, 0)
-    is_root = torch.zeros(n, 1)
-    is_root[root_idx, 0] = 1.0
+    is_root = torch.zeros(n)
+    is_root[root_idx] = 1.0
 
-    x = torch.stack([in_deg, out_deg, is_root.squeeze(1)], dim=1)  # [n, 3]
+    # --- Build adjacency list (parent -> children) for BFS-based features ---
+    children = {i: [] for i in range(n)}
+    for s, d, t in zip(src, dst, edge_time):
+        children[s].append((d, t))
+
+    # --- Depth from root (BFS) ---
+    depth = torch.zeros(n)
+    visited = {root_idx}
+    queue = [(root_idx, 0)]
+    qi = 0
+    while qi < len(queue):
+        node, d = queue[qi]
+        qi += 1
+        for child, _t in children.get(node, []):
+            if child not in visited:
+                visited.add(child)
+                depth[child] = d + 1
+                queue.append((child, d + 1))
+
+    # --- Subtree size (how many descendants each node has) ---
+    subtree_size = torch.zeros(n)
+    for node in range(n):
+        seen = set()
+        stack = [c for c, _t in children.get(node, [])]
+        while stack:
+            cur = stack.pop()
+            if cur not in seen:
+                seen.add(cur)
+                stack.extend(c for c, _t in children.get(cur, []))
+        subtree_size[node] = len(seen)
+
+    # --- Response time stats per node (based on OUTGOING edge times) ---
+    avg_response_time = torch.zeros(n)
+    min_response_time = torch.zeros(n)
+    for node in range(n):
+        times = [t for _c, t in children.get(node, [])]
+        if times:
+            avg_response_time[node] = sum(times) / len(times)
+            min_response_time[node] = min(times)
+
+    x = torch.stack([in_deg, out_deg, is_root, depth, subtree_size,
+                      avg_response_time, min_response_time], dim=1)  # [n, 7]
 
     y = torch.tensor([label_map[label_str]], dtype=torch.long)
 
